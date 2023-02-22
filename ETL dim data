@@ -1,0 +1,533 @@
+from pandas import DataFrame
+import psycopg2
+import csv
+import pandas as pd
+import sqlalchemy
+from sqlalchemy import create_engine, select, table, Table, Column, column, schema, MetaData, Integer, String, DateTime,text
+import time
+import json
+import boto3
+import os
+import sys
+import logging
+import psycopg2.extras as extras
+import base64
+from botocore.exceptions import ClientError
+from sqlalchemy import event
+from sqlalchemy.schema import CreateTable
+from sqlalchemy.dialects.mysql import BIT, BOOLEAN, INTEGER
+from sqlalchemy.dialects import mysql
+from sqlalchemy import event
+import numpy
+
+
+# In[2]:
+
+
+job_name = 'dim_cmx_customer'
+
+
+# In[3]:
+
+
+
+
+
+# In[4]:
+
+
+passwords = {}
+
+with open('/root/Python_jobs/Local_tmp/Tmp_files/serverless.csv', mode='r') as inp:
+    reader = csv.reader(inp)
+    passwords = {rows[0]:rows[1] for rows in reader}
+
+access_key = (base64.b64decode(passwords['access_key']).decode("utf-8"))
+secret_key = (base64.b64decode(passwords['secret_key']).decode("utf-8"))
+
+
+secret_name = "mar.python.serverless"
+region_name = "eu-west-1"
+
+
+session = boto3.session.Session()
+client = session.client(
+    aws_access_key_id=access_key, 
+    aws_secret_access_key=secret_key,
+    service_name='secretsmanager',
+    region_name=region_name
+)
+
+
+response = client.get_secret_value(SecretId=secret_name)
+secretDict = json.loads(response['SecretString'])
+
+dest_address = secretDict['address']
+dest_user = secretDict['username'] 
+dest_password = secretDict['password']
+
+
+# In[5]:
+
+#CMX creds
+passwords = {}
+
+with open('/root/Python_jobs/Local_tmp/Tmp_files/cmx.csv', mode='r') as inp:
+    reader = csv.reader(inp)
+    passwords = {rows[0]:rows[1] for rows in reader}
+
+cmx_u = (base64.b64decode(passwords['user']).decode("utf-8"))
+cmx_p = (base64.b64decode(passwords['password']).decode("utf-8"))
+
+#Connect to panoply database
+
+SOURCE_ADDRESS = '172.20.20.166' 
+SOURCE_PORT = '3306'
+SOURCE_USERNAME = cmx_u
+SOURCE_PASSWORD = cmx_p
+#SOURCE_DBNAME = 'mc2_prod' 
+
+src_creds = ('mysql+pymysql://{username}:{password}@{ipaddress}:{port}'.format(username=SOURCE_USERNAME, password=SOURCE_PASSWORD, ipaddress=SOURCE_ADDRESS, port=SOURCE_PORT))
+
+
+# In[6]:
+
+
+#Connect to Severless
+
+DEST_ADDRESS = dest_address 
+DEST_PORT = '5432'
+DEST_USERNAME = dest_user
+DEST_PASSWORD = dest_password
+DEST_DBNAME = 'mar_dw'
+
+dest_creds = ('postgresql://{username}:{password}@{ipaddress}:{port}/{dbname}'.format(username=DEST_USERNAME, password=DEST_PASSWORD,ipaddress=DEST_ADDRESS,port=DEST_PORT,dbname=DEST_DBNAME))
+
+#Create engion to serverless
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+
+
+# In[7]:
+
+
+job_start = text("""
+    insert into etl.etl_python_job_log
+        (job_name,
+        glue_name,
+        status,
+        start_time,
+        date) values('{}','Glue_name','Starting', current_timestamp,  current_date)""".format(job_name))
+conn_dest.execution_options(autocommit=True).execute(job_start)
+
+
+# In[8]:
+
+
+def failed_job(table_name, conn):
+    failed_job = text('''
+    update etl.etl_python_job_log
+    set
+        status = 'failed',
+        end_time = current_timestamp
+    where
+        job_name = '{}'
+        and start_time = (select max(start_time) from etl.etl_python_job_log where job_name = '{}')'''.format(job_name, job_name));
+    conn.execution_options(autocommit=True).execute(failed_job)
+
+
+# In[9]:
+
+
+def successful_try(step, table_name, conn):
+    table_logs = sqlalchemy.text("""insert into etl.etl_python_table_log 
+        (job_name,
+        glue_name,
+        table_name,
+        status,
+        step,
+        destination,
+        date,
+        insert_time) values('{}','Glue_name','{}','Successfull','{}','Serverless', now(), now())""".format(job_name, table_name, step));
+    conn.execution_options(autocommit=True).execute(table_logs)
+
+
+# In[10]:
+
+
+def failed_try(step, table_name, e, conn):
+    table_logs = sqlalchemy.text("""insert into etl.etl_python_table_log 
+        (job_name,
+        glue_name,
+        table_name,
+        status,
+        step,
+        error_message,
+        destination,
+        date) values('{}','Glue_name','{}','Failed','{}','{}','Serverless', now())""".format(job_name, table_name, step, e));
+    conn.execution_options(autocommit=True).execute(table_logs)
+
+
+# Serverless
+
+# In[11]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+
+drop_stm = text("""drop table if exists python_tmp.user_no""")
+conn_dest.execute(drop_stm)
+
+
+# In[12]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+
+create_stm = text("""
+    create table python_tmp.user_no as
+    Select distinct user_no
+    from
+        (
+    select distinct user_no
+    from messaging.cmx
+    union all
+    select distinct user_no
+    from payments.client_payments_detail
+    union all
+    select distinct user_no
+    from payments.digital_sales_detail) tmp
+""")
+conn_dest.execute(create_stm)
+
+
+# CMX
+
+# In[13]:
+
+
+conn_src = create_engine(src_creds, echo=False, echo_pool=False)
+
+drop_stm = text("""DROP TABLE IF EXISTS `common_tmp_local_tables`.`tmp_marketing_userdetails`""")
+conn_src.execute(drop_stm)
+
+
+# In[14]:
+
+
+conn_src = create_engine(src_creds, echo=False, echo_pool=False)
+try:
+    create_stm = text("""
+        CREATE TABLE `common_tmp_local_tables`.`tmp_marketing_userdetails` (
+            `user_no` DOUBLE DEFAULT NULL,
+            KEY `user_no` (`user_no`)
+        ) ENGINE=INNODB DEFAULT CHARSET=utf8
+    """)
+    conn_src.execute(create_stm)
+except Exception as e:
+    print(e)
+    failed_try('create table', 'tmp_marketing_userdetails', e, conn_dest)
+    failed_job('tmp_marketing_userdetails', conn_dest)
+    sys.exit()
+successful_try('Create table', 'tmp_marketing_userdetails', conn_dest)
+
+
+# Insert into cmx from serverless
+
+# In[15]:
+
+
+start_time_per = time.time()
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_src = create_engine(src_creds, echo=False, echo_pool=False)
+
+meta_p = MetaData(schema = 'common_tmp_local_tables')
+table_1 = Table('tmp_marketing_userdetails',
+            meta_p,
+            autoload_with=conn_src
+            )
+
+meta_sl = MetaData(schema = 'python_tmp')
+table_2 = Table('user_no',
+                meta_sl,
+                autoload_with=conn_dest
+                )
+
+start_time= time.time()
+
+q = select([table_2])
+proxy = conn_dest.execution_options(stream_results=True).execute(q)
+
+end_time = time.time()
+total_time = end_time - start_time
+print("Time: ", total_time)
+try:
+    batch_number = 0
+    while 'batch not empty':  # equivalent of 'while True', but clearer
+        batch = proxy.fetchmany(10000)  # 10,000 rows at a time
+
+        start_time= time.time()
+
+        batch_number = batch_number + 1
+        print(batch_number)
+
+        list1 = []
+
+        if not batch:
+            break
+
+        for row in batch:
+            d = dict(row._mapping.items())
+            list1.append(d)    
+
+        conn_src.execute(table_1.insert(), list1)  
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        print("Time: ", total_time)
+        
+        
+except Exception as e:
+    print(e)
+    failed_try('insert into', 'tmp_marketing_userdetails', e, conn_dest)
+    failed_job('tmp_marketing_userdetails', conn_dest)
+    sys.exit()
+successful_try('insert into', 'tmp_marketing_userdetails', conn_dest)
+    
+proxy.close()
+
+end_time = time.time()
+total_time = end_time - start_time_per
+print("Time: ", total_time)
+
+
+# From cmx to serverless
+
+# In[16]:
+
+
+try:
+    truncate_stm = text("""truncate python_tmp.dim_cmx_customer""")
+    conn_dest.execute(truncate_stm)
+except Exception as e:
+    print(e)
+    failed_try('truncate table', 'dim_cmx_customer', e, conn_dest)
+    failed_job('dim_cmx_customer', conn_dest)
+    sys.exit()
+successful_try('truncate table', 'dim_cmx_customer', conn_dest)
+
+
+# In[17]:
+
+
+start_time_per = time.time()
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_src = create_engine(src_creds, echo=False, echo_pool=False)
+
+
+meta_sl = MetaData(schema = 'python_tmp')
+table_2 = Table('dim_cmx_customer',
+                meta_sl,
+                autoload_with=conn_dest
+                )
+
+start_time= time.time()
+
+
+q = text("""
+SELECT 
+    p.user_no,
+    REPLACE(p.fname,","," ") AS fname,
+    REPLACE(p.sname,","," ") AS sname,
+    REPLACE(p.email,","," ") AS email,
+    p.country_id,
+    REPLACE(p.company,","," ") AS person_company,
+    c.client_id,
+    REPLACE(c.company,","," ") AS client_company,
+    IF(cuser.user_no IS NULL, ct2.type, ct1.type) AS customer_type,
+    IF(b.label IS NULL,"Pre-paid",b.label) AS account_type
+FROM cat.person p 
+    INNER JOIN `common_tmp_local_tables`.`tmp_marketing_userdetails` f ON p.user_no = f.user_no
+    LEFT JOIN cat.cli_user cu ON p.user_no = cu.user_no
+    LEFT JOIN cat.client c ON cu.client_no = c.client_no
+    LEFT JOIN cat.company_users AS cuser ON (cuser.user_no = p.user_no)  
+    LEFT JOIN cat.company AS comp ON (comp.company_id = cuser.company_id) 
+    LEFT JOIN cat.company_level AS cl1 ON (cl1.level_id = comp.level_id) 
+    LEFT JOIN cat.company_type AS ct1 ON (ct1.type_id = cl1.type_id) 
+    LEFT JOIN cat.company_level AS cl2 ON (cl2.level_id = cu.level_id) 
+    LEFT JOIN cat.company_type AS ct2 ON (ct2.type_id = cl2.type_id)
+    LEFT JOIN financial_data.billing_types b ON b.billing_type_id = comp.billing_type_id
+""")
+
+
+proxy = conn_src.execution_options(stream_results=True).execute(q)
+
+end_time = time.time()
+total_time = end_time - start_time
+print("Time: ", total_time)
+try:
+    batch_number = 0
+    while 'batch not empty':  # equivalent of 'while True', but clearer
+        batch = proxy.fetchmany(10000)  # 10,000 rows at a time
+
+        start_time= time.time()
+
+        batch_number = batch_number + 1
+        print(batch_number)
+
+        list1 = []
+
+        if not batch:
+            break
+
+        for row in batch:
+            d = dict(row._mapping.items())
+            list1.append(d)    
+
+        conn_dest.execute(table_2.insert(), list1)  
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        print("Time: ", total_time)
+        
+        
+except Exception as e:
+    print(e)
+    failed_try('insert into', 'dim_cmx_customer', e, conn_dest)
+    failed_job('dim_cmx_customer', conn_dest)
+    sys.exit()
+successful_try('insert into', 'dim_cmx_customer', conn_dest)
+
+proxy.close()
+
+end_time = time.time()
+total_time = end_time - start_time_per
+print("Time: ", total_time)
+
+
+# In[18]:
+
+
+truncate_stm = text("""Truncate common_tables.dim_cmx_customer""")
+
+
+# In[19]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_dest.execute(truncate_stm)
+
+
+# In[20]:
+
+
+insert_stm = text("""insert into common_tables.dim_cmx_customer (user_no, fname, sname, email, country_id, person_company, client_id, client_company, customer_type, account_type)
+select
+    c.user_no,
+    c.fname,
+    c.sname,
+    c.email,
+    c.country_id,
+    c.person_company,
+    c.client_id,
+    c.client_company,
+    c.customer_type,
+    c.account_type
+from python_tmp.dim_cmx_customer c""")
+
+
+# In[21]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_dest.execute(insert_stm)
+
+
+# In[22]:
+
+
+update_stm = text("""
+update common_tables.dim_cmx_customer src
+set client_company_format = dest.update_value
+    from
+    (
+Select client_id,max(client_company_format) as update_value
+from
+    (
+select client_id,
+       case
+           when length(client_company) = 0 and length(person_company) = 0 then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' and person_company = 'Personal Use' then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' and person_company = '' then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' then person_company
+           when client_company = '' and person_company = 'Personal Use'  then substring(email,position('@' in email) +1)
+           when client_company = '' then person_company
+           else client_company
+       end as client_company_format,
+       customer_type,
+       account_type
+    from python_tmp.dim_cmx_customer
+where client_id <> 'COMMUN') tmp
+group by client_id) dest
+where src.client_id = dest.client_id
+""")
+
+
+# In[23]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_dest.execute(update_stm)
+
+
+# In[24]:
+
+
+update_stm = text("""
+update common_tables.dim_cmx_customer src
+set client_company_format = dest.update_value
+    from
+    (
+Select user_no,max(client_company_format) as update_value
+from
+    (
+select user_no,
+       case
+           when length(client_company) = 0 and length(person_company) = 0 then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' and person_company = 'Personal Use' then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' and person_company = '' then substring(email,position('@' in email) +1)
+           when client_company = 'Personal Use' then person_company
+           when client_company = '' and person_company = 'Personal Use'  then substring(email,position('@' in email) +1)
+           when client_company = '' then person_company
+           else client_company
+       end as client_company_format,
+       customer_type,
+       account_type
+    from python_tmp.dim_cmx_customer
+where client_id = 'COMMUN') tmp
+group by user_no) dest
+where src.user_no = dest.user_no
+""")
+
+
+# In[25]:
+
+
+conn_dest = create_engine(dest_creds, echo=False, echo_pool=False)
+conn_dest.execute(update_stm)
+
+
+# In[26]:
+
+
+job_end = text("""
+    update etl.etl_python_job_log
+    set
+        status = 'Complete',
+        end_time = current_timestamp
+    where
+        job_name = '{}'
+        and start_time = (select max(start_time) from etl.etl_python_job_log where job_name = '{}')""".format(job_name, job_name));
+conn_dest.execution_options(autocommit=True).execute(job_end)
+
